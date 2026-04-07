@@ -1,0 +1,16 @@
+zig-out/
+zig-cache/
+.zig-cache/
+zig-pkg/
+proto/
+*.a
+*.o
+*.so
+*.dylib
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
