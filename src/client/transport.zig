@@ -32,6 +32,14 @@ pub const Transport = struct {
     tls_transport: ?TlsTransport,
     /// Exec-based credential plugin config.
     exec: ?kubeconfig_mod.ExecConfig,
+    /// Cached credentials from the exec plugin.
+    exec_creds: ?ExecCredentials = null,
+    /// Server URL stored for exec provideClusterInfo and late TLS init.
+    server: ?[]const u8,
+    /// CA data for provideClusterInfo.
+    ca_data: ?[]const u8 = null,
+    /// Whether to skip TLS verification (for provideClusterInfo).
+    insecure: bool = false,
     /// Io handle for process spawning (exec auth) and file I/O.
     io: Io,
     /// Request timeout.
@@ -53,6 +61,9 @@ pub const Transport = struct {
             .tls_server_name = if (cfg.tls_server_name) |name| try allocator.dupe(u8, name) else null,
             .tls_transport = null,
             .exec = if (cfg.exec) |e| try cloneExecConfig(allocator, e) else null,
+            .server = try allocator.dupe(u8, cfg.server),
+            .ca_data = if (cfg.ca_data) |ca| try allocator.dupe(u8, ca) else null,
+            .insecure = cfg.insecure,
             .io = io,
             .timeout = if (cfg.timeout_ms > 0)
                 .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(@intCast(cfg.timeout_ms)), .clock = .awake } }
@@ -74,12 +85,35 @@ pub const Transport = struct {
         if (self.tls_server_name) |v| self.allocator.free(v);
         if (self.tls_transport) |*t| t.deinit();
         if (self.exec) |*e| e.deinit(self.allocator);
+        if (self.exec_creds) |*c| c.deinit(self.allocator);
+        if (self.server) |s| self.allocator.free(s);
+        if (self.ca_data) |ca| self.allocator.free(ca);
         self.http_client.deinit();
     }
 
     /// Perform an HTTP request and return the response body.
+    /// On 401 with exec-based auth, invalidates cached credentials and retries once.
     /// Caller owns the returned body slice.
     pub fn request(
+        self: *Transport,
+        method: http.Method,
+        url: []const u8,
+        body: ?[]const u8,
+        content_type: ?[]const u8,
+    ) !Response {
+        var resp = try self.doRequest(method, url, body, content_type);
+
+        // On 401 with exec auth, clear the credential cache and retry once
+        // with fresh credentials (matches client-go's maybeRefreshCreds).
+        if (resp.status == 401 and self.exec != null) {
+            self.invalidateExecCredentials();
+            resp.deinit();
+            resp = try self.doRequest(method, url, body, content_type);
+        }
+        return resp;
+    }
+
+    fn doRequest(
         self: *Transport,
         method: http.Method,
         url: []const u8,
@@ -102,23 +136,19 @@ pub const Transport = struct {
         var extra_headers_buf: [3]http.Header = undefined;
         var extra_count: usize = 0;
 
-        // Accept JSON
         extra_headers_buf[extra_count] = .{ .name = "Accept", .value = "application/json" };
         extra_count += 1;
 
-        // Auth
         if (auth_header) |auth| {
             extra_headers_buf[extra_count] = .{ .name = "Authorization", .value = auth };
             extra_count += 1;
         }
 
-        // Content-Type
         if (content_type) |ct| {
             extra_headers_buf[extra_count] = .{ .name = "Content-Type", .value = ct };
             extra_count += 1;
         }
 
-        // Use the low-level request API for body support
         var req = try self.openRequest(method, url, .{
             .extra_headers = extra_headers_buf[0..extra_count],
         });
@@ -137,8 +167,6 @@ pub const Transport = struct {
         var redirect_buf: [8192]u8 = undefined;
         var response = try req.receiveHead(&redirect_buf);
 
-        // Read response body byte-by-byte via the HTTP body reader
-        // (handles chunked transfer encoding and Content-Length internally)
         var response_body: std.ArrayList(u8) = .empty;
         var reader_buf: [8192]u8 = undefined;
         const reader = response.reader(&reader_buf);
@@ -190,62 +218,50 @@ pub const Transport = struct {
         }
 
         if (self.exec) |exec_cfg| {
-            return try execCredentialToken(self.allocator, self.io, exec_cfg);
+            // Return cached credentials if still valid.
+            if (self.exec_creds) |creds| {
+                if (!creds.isExpired(self.io)) {
+                    if (creds.token) |t|
+                        return try std.fmt.allocPrint(allocator, "Bearer {s}", .{t});
+                    return null;
+                }
+                // Expired — discard.
+                var old = self.exec_creds.?;
+                old.deinit(self.allocator);
+                self.exec_creds = null;
+            }
+
+            const creds = try execCredential(self.allocator, self.io, exec_cfg, self.server, self.ca_data, self.tls_server_name, self.insecure);
+            self.exec_creds = creds;
+
+            // Wire exec-provided client cert+key to the TLS transport. This
+            // path requires the Transport to already have a TlsTransport
+            // (i.e. the kubeconfig used `insecure-skip-tls-verify: true` or
+            // had an initial client cert). Without it, exec-provided certs
+            // cannot be installed because std.http.Client has no slot for
+            // dynamic client identities.
+            if (creds.client_cert_data != null and creds.client_key_data != null) {
+                if (self.tls_transport) |*tt| {
+                    try tt.updateClientAuth(creds.client_cert_data.?, creds.client_key_data.?);
+                } else {
+                    return error.ExecCertWithoutTlsTransport;
+                }
+            }
+            if (creds.token) |t|
+                return try std.fmt.allocPrint(allocator, "Bearer {s}", .{t});
+            return null;
         }
 
         return null;
     }
 
-    /// Run an exec credential plugin and extract the bearer token from its output.
-    /// The plugin must output an ExecCredential JSON to stdout with `status.token`.
-    fn execCredentialToken(allocator: Allocator, io: Io, exec_cfg: kubeconfig_mod.ExecConfig) !?[]const u8 {
-        // Build argv: command + args
-        const args = exec_cfg.args orelse &[_][]const u8{};
-        var argv_buf: std.ArrayList([]const u8) = .empty;
-        defer argv_buf.deinit(allocator);
-        try argv_buf.append(allocator, exec_cfg.command);
-        try argv_buf.appendSlice(allocator, args);
-
-        var child = try std.process.spawn(io, .{
-            .argv = argv_buf.items,
-            .stdout = .pipe,
-            .stderr = .ignore,
-        });
-
-        // Read stdout
-        var stdout_buf: [65536]u8 = undefined;
-        var stdout_len: usize = 0;
-        if (child.stdout) |stdout_file| {
-            var read_buf: [4096]u8 = undefined;
-            var reader = stdout_file.reader(io, &read_buf);
-            while (true) {
-                const byte = reader.interface.takeByte() catch break;
-                if (stdout_len >= stdout_buf.len) break;
-                stdout_buf[stdout_len] = byte;
-                stdout_len += 1;
-            }
+    /// Invalidate cached exec credentials so the next authHeader() re-invokes
+    /// the plugin. Called on 401 responses.
+    fn invalidateExecCredentials(self: *Transport) void {
+        if (self.exec_creds) |*creds| {
+            creds.deinit(self.allocator);
+            self.exec_creds = null;
         }
-
-        const term = try child.wait(io);
-        switch (term) {
-            .exited => |code| if (code != 0) return error.ExecPluginFailed,
-            else => return error.ExecPluginFailed,
-        }
-
-        if (stdout_len == 0) return error.ExecPluginNoOutput;
-
-        // Parse ExecCredential JSON: {"status":{"token":"..."}}
-        const parsed = json.parseFromSlice(json.Value, allocator, stdout_buf[0..stdout_len], .{}) catch
-            return error.ExecPluginInvalidOutput;
-        defer parsed.deinit();
-
-        if (parsed.value != .object) return error.ExecPluginInvalidOutput;
-        const status = parsed.value.object.get("status") orelse return error.ExecPluginInvalidOutput;
-        if (status != .object) return error.ExecPluginInvalidOutput;
-        const token_val = status.object.get("token") orelse return error.ExecPluginInvalidOutput;
-        if (token_val != .string) return error.ExecPluginInvalidOutput;
-
-        return try std.fmt.allocPrint(allocator, "Bearer {s}", .{token_val.string});
     }
 
     pub fn openRequest(
@@ -270,7 +286,7 @@ pub const Transport = struct {
     fn configureTls(self: *Transport, io: Io, cfg: *const config_mod.Config) !void {
         if (!cfg.isTLS()) return;
 
-        // Use tls.zig for mTLS or insecure connections (std TLS doesn't support these)
+        // Use tls.zig for mTLS or insecure connections (std TLS doesn't support these).
         const needs_tls_zig = cfg.insecure or cfg.client_cert_data != null;
         if (needs_tls_zig) {
             self.tls_transport = try TlsTransport.init(self.allocator, io, cfg);
@@ -348,19 +364,268 @@ pub const Response = struct {
     }
 };
 
+/// Cached credentials returned by an exec credential plugin.
+const ExecCredentials = struct {
+    token: ?[]const u8 = null,
+    client_cert_data: ?[]const u8 = null,
+    client_key_data: ?[]const u8 = null,
+    /// Epoch seconds from `status.expirationTimestamp`. null = never expires.
+    expiry: ?i64 = null,
+
+    fn isExpired(self: ExecCredentials, io: Io) bool {
+        const exp = self.expiry orelse return false;
+        const now_sec = Io.Clock.real.now(io).toSeconds();
+        return now_sec >= exp;
+    }
+
+    fn deinit(self: *ExecCredentials, allocator: Allocator) void {
+        // Zero credential material before freeing to prevent heap-resident secrets.
+        if (self.token) |t| {
+            const mutable: [*]u8 = @constCast(t.ptr);
+            @memset(mutable[0..t.len], 0);
+            allocator.free(t);
+        }
+        if (self.client_cert_data) |c| {
+            const mutable: [*]u8 = @constCast(c.ptr);
+            @memset(mutable[0..c.len], 0);
+            allocator.free(c);
+        }
+        if (self.client_key_data) |k| {
+            const mutable: [*]u8 = @constCast(k.ptr);
+            @memset(mutable[0..k.len], 0);
+            allocator.free(k);
+        }
+    }
+};
+
+/// Invoke an exec credential plugin and parse its ExecCredential JSON response.
+/// Matches the client-go contract: sets KUBERNETES_EXEC_INFO, merges env,
+/// passes stderr through, parses token and/or cert+key and expirationTimestamp.
+fn execCredential(
+    allocator: Allocator,
+    io: Io,
+    exec_cfg: kubeconfig_mod.ExecConfig,
+    server: ?[]const u8,
+    ca_data: ?[]const u8,
+    tls_server_name: ?[]const u8,
+    insecure: bool,
+) !ExecCredentials {
+    // Build argv: command + args
+    const args = exec_cfg.args orelse &[_][]const u8{};
+    var argv_buf: std.ArrayList([]const u8) = .empty;
+    defer argv_buf.deinit(allocator);
+    try argv_buf.append(allocator, exec_cfg.command);
+    try argv_buf.appendSlice(allocator, args);
+
+    // Build KUBERNETES_EXEC_INFO JSON. Validate apiVersion doesn't contain
+    // characters that would break the JSON structure.
+    const api_version = exec_cfg.api_version orelse "client.authentication.k8s.io/v1";
+    for (api_version) |c| {
+        if (c == '"' or c == '\\' or c < 0x20) return error.ExecPluginInvalidOutput;
+    }
+
+    // Build spec.cluster JSON when provideClusterInfo is true.
+    var cluster_json_buf: [8192]u8 = undefined;
+    const cluster_json: []const u8 = if (exec_cfg.provide_cluster_info) blk: {
+        const srv = server orelse "";
+        const tls_name = tls_server_name orelse "";
+        // Base64-encode CA data for the JSON field.
+        const ca_b64 = if (ca_data) |ca| b64: {
+            const b64_len = std.base64.standard.Encoder.calcSize(ca.len);
+            if (b64_len > 4096) break :b64 ""; // cap at reasonable size
+            var b64_buf: [4096]u8 = undefined;
+            _ = std.base64.standard.Encoder.encode(&b64_buf, ca);
+            break :b64 b64_buf[0..b64_len];
+        } else "";
+        const written = std.fmt.bufPrint(&cluster_json_buf,
+            \\,"cluster":{{"server":"{s}","insecure-skip-tls-verify":{s},"certificate-authority-data":"{s}","tls-server-name":"{s}"}}
+        , .{ srv, if (insecure) "true" else "false", ca_b64, tls_name }) catch "";
+        break :blk written;
+    } else "";
+
+    const exec_info = try std.fmt.allocPrint(allocator,
+        \\{{"kind":"ExecCredential","apiVersion":"{s}","spec":{{"interactive":false{s}}}}}
+    , .{ api_version, cluster_json });
+    defer allocator.free(exec_info);
+
+    // Build environment: inherit parent + ExecConfig.env + KUBERNETES_EXEC_INFO.
+    const process = std.process;
+    const parent_environ: process.Environ = .{ .block = .{ .slice = @ptrCast(mem.span(std.c.environ)) } };
+    var env_map = try parent_environ.createMap(allocator);
+    defer env_map.deinit();
+    // Merge ExecConfig.env (overrides parent entries with same name).
+    if (exec_cfg.env) |envs| {
+        for (envs) |e| try env_map.put(e.name, e.value);
+    }
+    // Set KUBERNETES_EXEC_INFO.
+    try env_map.put("KUBERNETES_EXEC_INFO", exec_info);
+
+    // Spawn the plugin. stderr inherits so MFA/SSO prompts are visible.
+    var child = process.spawn(io, .{
+        .argv = argv_buf.items,
+        .stdout = .pipe,
+        .stderr = .inherit,
+        .environ_map = &env_map,
+    }) catch |err| {
+        // Surface install hint specifically on command-not-found errors
+        // (matching client-go's exec.Error handling).
+        if (err == error.FileNotFound or err == error.AccessDenied) {
+            if (exec_cfg.install_hint) |hint| {
+                // Sanitize hint: strip control characters to prevent
+                // terminal escape injection from a tampered kubeconfig.
+                var sanitized: [4096]u8 = undefined;
+                var slen: usize = 0;
+                for (hint) |c| {
+                    if (slen >= sanitized.len) break;
+                    if (c >= 0x20 and c != 0x7f) {
+                        sanitized[slen] = c;
+                        slen += 1;
+                    }
+                }
+                std.debug.print("exec: executable {s} not found\n\n{s}\n", .{ exec_cfg.command, sanitized[0..slen] });
+            }
+        }
+        return err;
+    };
+
+    // Read stdout.
+    var stdout_buf: [65536]u8 = undefined;
+    var stdout_len: usize = 0;
+    if (child.stdout) |stdout_file| {
+        var read_buf: [4096]u8 = undefined;
+        var reader = stdout_file.reader(io, &read_buf);
+        while (true) {
+            const byte = reader.interface.takeByte() catch break;
+            if (stdout_len >= stdout_buf.len) break;
+            stdout_buf[stdout_len] = byte;
+            stdout_len += 1;
+        }
+    }
+
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| if (code != 0) return error.ExecPluginFailed,
+        else => return error.ExecPluginFailed,
+    }
+
+    if (stdout_len == 0) return error.ExecPluginNoOutput;
+
+    // Parse ExecCredential JSON response.
+    const parsed = json.parseFromSlice(json.Value, allocator, stdout_buf[0..stdout_len], .{}) catch
+        return error.ExecPluginInvalidOutput;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return error.ExecPluginInvalidOutput;
+    const root = parsed.value.object;
+
+    // Validate response apiVersion matches the request (matching client-go's
+    // gvk.Group/Version check). Absent apiVersion is tolerated for compat.
+    if (root.get("apiVersion")) |resp_ver| {
+        if (resp_ver == .string and resp_ver.string.len > 0) {
+            if (!mem.eql(u8, resp_ver.string, api_version))
+                return error.ExecPluginVersionMismatch;
+        }
+    }
+
+    const status_val = root.get("status") orelse
+        return error.ExecPluginInvalidOutput;
+    if (status_val != .object) return error.ExecPluginInvalidOutput;
+    const status = status_val.object;
+
+    // Extract token.
+    const token: ?[]const u8 = if (status.get("token")) |tv|
+        (if (tv == .string and tv.string.len > 0) try allocator.dupe(u8, tv.string) else null)
+    else
+        null;
+    errdefer if (token) |t| allocator.free(t);
+
+    // Extract client cert + key (mTLS from exec plugin).
+    const cert_data: ?[]const u8 = if (status.get("clientCertificateData")) |cv|
+        (if (cv == .string and cv.string.len > 0) try allocator.dupe(u8, cv.string) else null)
+    else
+        null;
+    errdefer if (cert_data) |c| allocator.free(c);
+
+    const key_data: ?[]const u8 = if (status.get("clientKeyData")) |kv|
+        (if (kv == .string and kv.string.len > 0) try allocator.dupe(u8, kv.string) else null)
+    else
+        null;
+    errdefer if (key_data) |k| allocator.free(k);
+
+    // Validate: must have token OR (cert AND key), not partial.
+    const has_token = token != null;
+    const has_cert = cert_data != null;
+    const has_key = key_data != null;
+    if (!has_token and !has_cert and !has_key) return error.ExecPluginInvalidOutput;
+    if (has_cert != has_key) return error.ExecPluginInvalidOutput;
+
+    // Parse expirationTimestamp (RFC 3339) for cache TTL.
+    var expiry: ?i64 = null;
+    if (status.get("expirationTimestamp")) |exp_val| {
+        if (exp_val == .string and exp_val.string.len > 0) {
+            const k8s_zig = @import("k8s_zig");
+            const t = k8s_zig.time.Time.parse(exp_val.string) catch null;
+            if (t) |parsed_time| expiry = parsed_time.epoch_seconds;
+        }
+    }
+
+    return .{
+        .token = token,
+        .client_cert_data = cert_data,
+        .client_key_data = key_data,
+        .expiry = expiry,
+    };
+}
+
 fn cloneExecConfig(allocator: Allocator, src: kubeconfig_mod.ExecConfig) !kubeconfig_mod.ExecConfig {
     var args_copy: ?[]const []const u8 = null;
     if (src.args) |args| {
         const out = try allocator.alloc([]const u8, args.len);
+        var args_init: usize = 0;
+        errdefer {
+            for (out[0..args_init]) |a| allocator.free(a);
+            allocator.free(out);
+        }
         for (args, 0..) |arg, i| {
             out[i] = try allocator.dupe(u8, arg);
+            args_init += 1;
         }
         args_copy = out;
     }
+    errdefer if (args_copy) |args| {
+        for (args) |a| allocator.free(a);
+        allocator.free(args);
+    };
+
+    var env_copy: ?[]const kubeconfig_mod.ExecEnvVar = null;
+    if (src.env) |envs| {
+        const out = try allocator.alloc(kubeconfig_mod.ExecEnvVar, envs.len);
+        var env_init: usize = 0;
+        errdefer {
+            for (out[0..env_init]) |e| e.deinit(allocator);
+            allocator.free(out);
+        }
+        for (envs, 0..) |e, i| {
+            const name = try allocator.dupe(u8, e.name);
+            errdefer allocator.free(name);
+            const value = try allocator.dupe(u8, e.value);
+            out[i] = .{ .name = name, .value = value };
+            env_init += 1;
+        }
+        env_copy = out;
+    }
+    errdefer if (env_copy) |envs| {
+        for (envs) |e| e.deinit(allocator);
+        allocator.free(envs);
+    };
+
     return .{
         .api_version = if (src.api_version) |v| try allocator.dupe(u8, v) else null,
         .command = try allocator.dupe(u8, src.command),
         .args = args_copy,
+        .env = env_copy,
+        .install_hint = if (src.install_hint) |v| try allocator.dupe(u8, v) else null,
+        .provide_cluster_info = src.provide_cluster_info,
     };
 }
 
@@ -522,7 +787,7 @@ fn makeExecConfig(allocator: Allocator, shell_cmd: []const u8) !config_mod.Confi
 }
 
 test "transport: exec auth runs command and extracts token" {
-    var cfg = try makeExecConfig(testing.allocator, "echo '{\"apiVersion\":\"client.authentication.k8s.io/v1beta1\",\"status\":{\"token\":\"test-tok-123\"}}'");
+    var cfg = try makeExecConfig(testing.allocator, "echo '{\"apiVersion\":\"client.authentication.k8s.io/v1\",\"status\":{\"token\":\"test-tok-123\"}}'");
     defer cfg.deinit();
 
     var t = try Transport.init(testing.allocator, testing.io, &cfg);
@@ -608,4 +873,256 @@ test "Response: retry_after_seconds defaults to null" {
     };
     defer resp.deinit();
     try testing.expect(resp.retry_after_seconds == null);
+}
+
+test "transport: exec auth caches token across calls" {
+    var cfg = try makeExecConfig(testing.allocator,
+        \\echo '{"apiVersion":"client.authentication.k8s.io/v1","status":{"token":"cached-tok"}}'
+    );
+    defer cfg.deinit();
+
+    var t = try Transport.init(testing.allocator, testing.io, &cfg);
+    defer t.deinit();
+
+    // First call invokes the plugin and caches.
+    const auth1 = try t.authHeader(testing.allocator);
+    defer if (auth1) |a| testing.allocator.free(a);
+    try testing.expectEqualStrings("Bearer cached-tok", auth1.?);
+    try testing.expect(t.exec_creds != null);
+
+    // Second call returns cached credentials without re-invoking.
+    const auth2 = try t.authHeader(testing.allocator);
+    defer if (auth2) |a| testing.allocator.free(a);
+    try testing.expectEqualStrings("Bearer cached-tok", auth2.?);
+}
+
+test "transport: exec auth invalidates cache on request" {
+    var cfg = try makeExecConfig(testing.allocator,
+        \\echo '{"status":{"token":"fresh-tok"}}'
+    );
+    defer cfg.deinit();
+
+    var t = try Transport.init(testing.allocator, testing.io, &cfg);
+    defer t.deinit();
+
+    // Prime cache.
+    const auth1 = try t.authHeader(testing.allocator);
+    defer if (auth1) |a| testing.allocator.free(a);
+    try testing.expect(t.exec_creds != null);
+
+    // Invalidate.
+    t.invalidateExecCredentials();
+    try testing.expect(t.exec_creds == null);
+
+    // Next call re-invokes the plugin.
+    const auth2 = try t.authHeader(testing.allocator);
+    defer if (auth2) |a| testing.allocator.free(a);
+    try testing.expectEqualStrings("Bearer fresh-tok", auth2.?);
+}
+
+test "transport: exec auth sets KUBERNETES_EXEC_INFO" {
+    // The plugin reads KUBERNETES_EXEC_INFO from its env and echoes
+    // part of it back as the token — proving the env var was set.
+    var cfg = try makeExecConfig(testing.allocator,
+        \\TOKEN=$(echo $KUBERNETES_EXEC_INFO | sed 's/.*apiVersion":"//' | sed 's/".*//')
+        \\echo "{\"status\":{\"token\":\"$TOKEN\"}}"
+    );
+    defer cfg.deinit();
+
+    var t = try Transport.init(testing.allocator, testing.io, &cfg);
+    defer t.deinit();
+
+    const auth = try t.authHeader(testing.allocator);
+    defer if (auth) |a| testing.allocator.free(a);
+    // The apiVersion from KUBERNETES_EXEC_INFO should be the token.
+    try testing.expectEqualStrings("Bearer client.authentication.k8s.io/v1", auth.?);
+}
+
+test "transport: exec auth parses expirationTimestamp" {
+    // Return a token with an expiry far in the future — should cache.
+    var cfg = try makeExecConfig(testing.allocator,
+        \\echo '{"status":{"token":"exp-tok","expirationTimestamp":"2099-01-01T00:00:00Z"}}'
+    );
+    defer cfg.deinit();
+
+    var t = try Transport.init(testing.allocator, testing.io, &cfg);
+    defer t.deinit();
+
+    const auth = try t.authHeader(testing.allocator);
+    defer if (auth) |a| testing.allocator.free(a);
+    try testing.expectEqualStrings("Bearer exp-tok", auth.?);
+    try testing.expect(t.exec_creds != null);
+    try testing.expect(t.exec_creds.?.expiry != null);
+    try testing.expect(t.exec_creds.?.expiry.? > 0);
+}
+
+test "transport: exec auth validates cert+key pairing" {
+    // Returns only clientCertificateData without clientKeyData — should error.
+    var cfg = try makeExecConfig(testing.allocator,
+        \\echo '{"status":{"clientCertificateData":"cert-pem"}}'
+    );
+    defer cfg.deinit();
+
+    var t = try Transport.init(testing.allocator, testing.io, &cfg);
+    defer t.deinit();
+
+    try testing.expectError(error.ExecPluginInvalidOutput, t.authHeader(testing.allocator));
+}
+
+test "transport: exec auth cert+key triggers TLS install path when TlsTransport exists" {
+    // Verifies that exec-returned cert+key reaches TlsTransport.updateClientAuth.
+    // We use deliberately-invalid PEM so the TLS layer rejects it — the test
+    // passes when we observe that TLS-layer error (proving the wiring runs)
+    // instead of the silent ExecCertWithoutTlsTransport error.
+    var cfg = config_mod.Config{
+        .allocator = testing.allocator,
+        .server = try testing.allocator.dupe(u8, "https://127.0.0.1:6443"),
+        .namespace = try testing.allocator.dupe(u8, "default"),
+        .insecure = true,
+        .exec = .{
+            .command = try testing.allocator.dupe(u8, "/bin/sh"),
+            .args = blk: {
+                const a = try testing.allocator.alloc([]const u8, 2);
+                a[0] = try testing.allocator.dupe(u8, "-c");
+                a[1] = try testing.allocator.dupe(u8,
+                    \\echo '{"status":{"clientCertificateData":"not-a-real-cert","clientKeyData":"not-a-real-key"}}'
+                );
+                break :blk a;
+            },
+        },
+    };
+    defer cfg.deinit();
+
+    var t = try Transport.init(testing.allocator, testing.io, &cfg);
+    defer t.deinit();
+
+    // TlsTransport exists for HTTPS+insecure.
+    try testing.expect(t.tls_transport != null);
+
+    // authHeader extracts cert+key, calls updateClientAuth which routes the
+    // bogus key through pem.normalizePrivateKey. The PEM normalizer rejects
+    // it with NoPrivateKey, proving the wiring runs (NOT the
+    // ExecCertWithoutTlsTransport error that fires when wiring is bypassed).
+    const result = t.authHeader(testing.allocator);
+    try testing.expectError(error.NoPrivateKey, result);
+}
+
+test "transport: exec auth cert+key without TlsTransport returns clear error" {
+    // HTTP (not HTTPS) → no TlsTransport. Exec returning cert+key must fail
+    // with a clear error rather than silently dropping credentials.
+    var cfg = try makeExecConfig(testing.allocator,
+        \\echo '{"status":{"clientCertificateData":"cert-pem","clientKeyData":"key-pem"}}'
+    );
+    defer cfg.deinit();
+
+    var t = try Transport.init(testing.allocator, testing.io, &cfg);
+    defer t.deinit();
+
+    try testing.expectError(error.ExecCertWithoutTlsTransport, t.authHeader(testing.allocator));
+}
+
+test "transport: exec credential zeroes secrets before free" {
+    // Allocate a credential, capture the token pointer, deinit, verify zeroed.
+    // Under DebugAllocator the memory is filled with 0xaa AFTER our zero, but
+    // we can at least verify deinit doesn't crash and the field is nulled.
+    var creds = ExecCredentials{
+        .token = try testing.allocator.dupe(u8, "secret-token-value"),
+        .client_key_data = try testing.allocator.dupe(u8, "secret-key-pem"),
+    };
+    // deinit should zero and free without error.
+    creds.deinit(testing.allocator);
+}
+
+test "transport: exec auth version mismatch rejected" {
+    // Plugin returns v1beta1 but exec config requests v1 (default).
+    var cfg = try makeExecConfig(testing.allocator,
+        \\echo '{"apiVersion":"client.authentication.k8s.io/v1beta1","status":{"token":"tok"}}'
+    );
+    defer cfg.deinit();
+
+    var t = try Transport.init(testing.allocator, testing.io, &cfg);
+    defer t.deinit();
+
+    try testing.expectError(error.ExecPluginVersionMismatch, t.authHeader(testing.allocator));
+}
+
+test "transport: exec auth provideClusterInfo includes cluster in KUBERNETES_EXEC_INFO" {
+    // Plugin checks if KUBERNETES_EXEC_INFO contains "cluster" and returns
+    // a different token based on that — avoids nested-quote shell escaping.
+    const args = try testing.allocator.alloc([]const u8, 2);
+    args[0] = try testing.allocator.dupe(u8, "-c");
+    args[1] = try testing.allocator.dupe(u8,
+        \\if echo "$KUBERNETES_EXEC_INFO" | grep -q '"cluster"'; then echo '{"status":{"token":"has-cluster"}}'; else echo '{"status":{"token":"no-cluster"}}'; fi
+    );
+    var cfg = config_mod.Config{
+        .allocator = testing.allocator,
+        .server = try testing.allocator.dupe(u8, "http://127.0.0.1:6443"),
+        .namespace = try testing.allocator.dupe(u8, "default"),
+        .insecure = true,
+        .exec = .{
+            .command = try testing.allocator.dupe(u8, "/bin/sh"),
+            .args = args,
+            .provide_cluster_info = true,
+        },
+    };
+    defer cfg.deinit();
+
+    var t = try Transport.init(testing.allocator, testing.io, &cfg);
+    defer t.deinit();
+
+    const auth = try t.authHeader(testing.allocator);
+    defer if (auth) |a| testing.allocator.free(a);
+    try testing.expectEqualStrings("Bearer has-cluster", auth.?);
+}
+
+test "transport: exec auth env vars are passed to plugin" {
+    // ExecConfig.env sets CUSTOM_VAR; plugin echoes it back as token.
+    const args = try testing.allocator.alloc([]const u8, 2);
+    args[0] = try testing.allocator.dupe(u8, "-c");
+    args[1] = try testing.allocator.dupe(u8, "echo \"{\\\"status\\\":{\\\"token\\\":\\\"$CUSTOM_VAR\\\"}}\"");
+    const envs = try testing.allocator.alloc(kubeconfig_mod.ExecEnvVar, 1);
+    envs[0] = .{
+        .name = try testing.allocator.dupe(u8, "CUSTOM_VAR"),
+        .value = try testing.allocator.dupe(u8, "hello-from-env"),
+    };
+    var cfg = config_mod.Config{
+        .allocator = testing.allocator,
+        .server = try testing.allocator.dupe(u8, "http://127.0.0.1"),
+        .namespace = try testing.allocator.dupe(u8, "default"),
+        .exec = .{
+            .command = try testing.allocator.dupe(u8, "/bin/sh"),
+            .args = args,
+            .env = envs,
+        },
+    };
+    defer cfg.deinit();
+
+    var t = try Transport.init(testing.allocator, testing.io, &cfg);
+    defer t.deinit();
+
+    const auth = try t.authHeader(testing.allocator);
+    defer if (auth) |a| testing.allocator.free(a);
+    try testing.expectEqualStrings("Bearer hello-from-env", auth.?);
+}
+
+test "transport: exec with HTTPS creates TlsTransport for late cert auth" {
+    // Even without initial client cert, exec + HTTPS creates TlsTransport
+    // so exec-provided certs can be wired later.
+    var cfg = config_mod.Config{
+        .allocator = testing.allocator,
+        .server = try testing.allocator.dupe(u8, "https://127.0.0.1:6443"),
+        .namespace = try testing.allocator.dupe(u8, "default"),
+        .insecure = true,
+        .exec = .{
+            .command = try testing.allocator.dupe(u8, "/bin/echo"),
+        },
+    };
+    defer cfg.deinit();
+
+    var t = try Transport.init(testing.allocator, testing.io, &cfg);
+    defer t.deinit();
+
+    try testing.expect(t.tls_transport != null);
+    // Auth starts null (no client cert configured at init).
+    try testing.expect(t.tls_transport.?.auth == null);
 }

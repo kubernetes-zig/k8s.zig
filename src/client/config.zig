@@ -145,10 +145,31 @@ fn cloneExecConfig(allocator: Allocator, src: kubeconfig.ExecConfig) !kubeconfig
         args_copy = out;
     }
 
+    var env_copy: ?[]const kubeconfig.ExecEnvVar = null;
+    if (src.env) |envs| {
+        const out = try allocator.alloc(kubeconfig.ExecEnvVar, envs.len);
+        var env_init_count: usize = 0;
+        errdefer {
+            for (out[0..env_init_count]) |e| e.deinit(allocator);
+            allocator.free(out);
+        }
+        for (envs, 0..) |e, i| {
+            const name = try allocator.dupe(u8, e.name);
+            errdefer allocator.free(name);
+            const value = try allocator.dupe(u8, e.value);
+            out[i] = .{ .name = name, .value = value };
+            env_init_count += 1;
+        }
+        env_copy = out;
+    }
+
     return .{
         .api_version = if (src.api_version) |v| try allocator.dupe(u8, v) else null,
         .command = try allocator.dupe(u8, src.command),
         .args = args_copy,
+        .env = env_copy,
+        .install_hint = if (src.install_hint) |v| try allocator.dupe(u8, v) else null,
+        .provide_cluster_info = src.provide_cluster_info,
     };
 }
 

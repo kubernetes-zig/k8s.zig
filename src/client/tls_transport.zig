@@ -7,6 +7,7 @@ const Allocator = mem.Allocator;
 const testing = std.testing;
 const tls = @import("tls");
 const config_mod = @import("config.zig");
+const pem_mod = @import("pem.zig");
 
 /// Read a chunked transfer-encoded body. Format: hex-size\r\n data\r\n ... 0\r\n\r\n
 fn readChunkedBody(conn: *tls.Connection, allocator: Allocator, body: *std.ArrayList(u8)) !void {
@@ -62,6 +63,24 @@ fn componentToStr(comp: Uri.Component) []const u8 {
     };
 }
 
+/// Build the HTTP request-target from a parsed URI: `path?query` if a query
+/// is present, else just `path`. The result is written into `buf` and returned
+/// as a slice into it.
+fn buildRequestTarget(uri: Uri, buf: []u8) ![]const u8 {
+    const path = if (uri.path.isEmpty()) "/" else componentToStr(uri.path);
+    if (uri.query) |q| {
+        const q_str = componentToStr(q);
+        if (path.len + 1 + q_str.len > buf.len) return error.RequestTargetTooLong;
+        @memcpy(buf[0..path.len], path);
+        buf[path.len] = '?';
+        @memcpy(buf[path.len + 1 ..][0..q_str.len], q_str);
+        return buf[0 .. path.len + 1 + q_str.len];
+    }
+    if (path.len > buf.len) return error.RequestTargetTooLong;
+    @memcpy(buf[0..path.len], path);
+    return buf[0..path.len];
+}
+
 /// TLS transport backed by tls.zig for mTLS and insecure connections.
 /// Provides HTTP/1.1 request/response framing over a tls.zig connection
 /// with connection pooling (keep-alive reuse).
@@ -75,6 +94,9 @@ pub const TlsTransport = struct {
     insecure: bool,
     root_ca: ?tls.config.cert.Bundle,
     auth: ?tls.config.CertKeyPair,
+    /// Override hostname used for TLS handshake (SNI + cert verification),
+    /// from kubeconfig `tls-server-name`. Falls back to `host` if null.
+    tls_server_name: ?[]const u8,
 
     // Connection timeout
     timeout: Io.Timeout,
@@ -119,9 +141,20 @@ pub const TlsTransport = struct {
         errdefer if (auth) |*a| a.deinit(allocator);
 
         if (cfg.client_cert_data) |cert_pem| {
-            const key_pem = cfg.client_key_data orelse return error.MissingClientKey;
+            const key_pem_raw = cfg.client_key_data orelse return error.MissingClientKey;
+            // Normalize key PEM: tls.zig only accepts PKCS#8 and SEC1 EC, but
+            // kubeadm/kind/older kubectl ship PKCS#1 RSA keys. This wraps them
+            // in PKCS#8 without touching key material.
+            const key_pem = try pem_mod.normalizePrivateKey(allocator, key_pem_raw);
+            defer allocator.free(key_pem);
             auth = try tls.config.CertKeyPair.fromSlice(allocator, io, cert_pem, key_pem);
         }
+
+        const tls_server_name: ?[]const u8 = if (cfg.tls_server_name) |n|
+            try allocator.dupe(u8, n)
+        else
+            null;
+        errdefer if (tls_server_name) |n| allocator.free(n);
 
         return .{
             .allocator = allocator,
@@ -131,6 +164,7 @@ pub const TlsTransport = struct {
             .insecure = cfg.insecure,
             .root_ca = root_ca,
             .auth = auth,
+            .tls_server_name = tls_server_name,
             .timeout = if (cfg.timeout_ms > 0)
                 .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(@intCast(cfg.timeout_ms)), .clock = .awake } }
             else
@@ -142,7 +176,23 @@ pub const TlsTransport = struct {
         self.closeIdle();
         if (self.root_ca) |*ca| ca.deinit(self.allocator);
         if (self.auth) |*a| a.deinit(self.allocator);
+        if (self.tls_server_name) |n| self.allocator.free(n);
         self.allocator.free(self.host);
+    }
+
+    /// Hot-swap client certificate+key for exec credential plugin auth.
+    /// Normalizes the key PEM (PKCS#1 → PKCS#8 if needed) and rebuilds
+    /// the CertKeyPair. Closes any idle connections so the next request
+    /// performs a fresh TLS handshake with the new identity.
+    pub fn updateClientAuth(self: *TlsTransport, cert_pem: []const u8, key_pem: []const u8) !void {
+        if (self.auth) |*old| old.deinit(self.allocator);
+        self.auth = null;
+        self.closeIdle(); // force fresh handshake with new creds
+
+        const pem_normalize = @import("pem.zig");
+        const normalized_key = try pem_normalize.normalizePrivateKey(self.allocator, key_pem);
+        defer self.allocator.free(normalized_key);
+        self.auth = try tls.config.CertKeyPair.fromSlice(self.allocator, self.io, cert_pem, normalized_key);
     }
 
     fn closeIdle(self: *TlsTransport) void {
@@ -181,15 +231,19 @@ pub const TlsTransport = struct {
         state.reader = state.stream.reader(self.io, &state.input_buf);
         state.writer = state.stream.writer(self.io, &state.output_buf);
 
-        // TLS handshake
+        // TLS handshake. Use tls_server_name override (kubeconfig
+        // `tls-server-name`) for SNI + cert verification when set, so users
+        // connecting to an IP endpoint with a DNS-named cert can verify
+        // against the DNS name without disabling TLS.
         const rng_impl: std.Random.IoSource = .{ .io = self.io };
+        const verify_host = self.tls_server_name orelse self.host;
         const tls_conn = try tls.client(
             &state.reader.interface,
             &state.writer.interface,
             .{
                 .rng = rng_impl.interface(),
                 .now = Io.Clock.real.now(self.io),
-                .host = self.host,
+                .host = verify_host,
                 .root_ca = self.root_ca orelse .empty,
                 .insecure_skip_verify = self.insecure,
                 .auth = if (self.auth) |*a| a else null,
@@ -216,10 +270,11 @@ pub const TlsTransport = struct {
         errdefer conn.destroy();
 
         const uri = try Uri.parse(url);
-        const path = if (uri.path.isEmpty()) "/" else componentToStr(uri.path);
+        var target_buf: [4096]u8 = undefined;
+        const target = try buildRequestTarget(uri, &target_buf);
 
         // Write request
-        try conn.writeRequest(method, path, if (uri.host) |h| componentToStr(h) else self.host, auth_header, content_type, body);
+        try conn.writeRequest(method, target, if (uri.host) |h| componentToStr(h) else self.host, auth_header, content_type, body);
 
         // Read response head
         const head = try conn.readResponseHead(self.allocator);
@@ -273,9 +328,10 @@ pub const TlsTransport = struct {
         errdefer conn.destroy();
 
         const uri = try Uri.parse(url);
-        const path = if (uri.path.isEmpty()) "/" else componentToStr(uri.path);
+        var target_buf: [4096]u8 = undefined;
+        const target = try buildRequestTarget(uri, &target_buf);
 
-        try conn.writeRequest(method, path, if (uri.host) |h| componentToStr(h) else self.host, auth_header, "application/json", null);
+        try conn.writeRequest(method, target, if (uri.host) |h| componentToStr(h) else self.host, auth_header, "application/json", null);
 
         const head = try conn.readResponseHead(self.allocator);
 
@@ -449,6 +505,40 @@ fn parseResponseHead(raw: []const u8) !ParsedResponseHead {
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
+test "buildRequestTarget: preserves query string" {
+    const Case = struct {
+        url: []const u8,
+        expected: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .url = "https://api.k8s/api/v1/pods", .expected = "/api/v1/pods" },
+        .{ .url = "https://api.k8s/api/v1/pods?watch=true", .expected = "/api/v1/pods?watch=true" },
+        .{
+            .url = "https://api.k8s/api/v1/namespaces/default/pods?watch=true&resourceVersion=12345",
+            .expected = "/api/v1/namespaces/default/pods?watch=true&resourceVersion=12345",
+        },
+        .{
+            .url = "https://api.k8s/apis/apps/v1/deployments?labelSelector=app%3Dnginx",
+            .expected = "/apis/apps/v1/deployments?labelSelector=app%3Dnginx",
+        },
+        .{ .url = "https://api.k8s/", .expected = "/" },
+        .{ .url = "https://api.k8s", .expected = "/" },
+        .{ .url = "https://api.k8s?continue=abc", .expected = "/?continue=abc" },
+    };
+    for (cases) |c| {
+        const uri = try Uri.parse(c.url);
+        var buf: [256]u8 = undefined;
+        const target = try buildRequestTarget(uri, &buf);
+        try testing.expectEqualStrings(c.expected, target);
+    }
+}
+
+test "buildRequestTarget: rejects oversized targets" {
+    const uri = try Uri.parse("https://h/" ++ "x" ** 100 ++ "?q=" ++ "y" ** 100);
+    var buf: [50]u8 = undefined;
+    try testing.expectError(error.RequestTargetTooLong, buildRequestTarget(uri, &buf));
+}
+
 test "TlsTransport: init table-driven" {
     const Case = struct {
         server: []const u8,
@@ -504,6 +594,28 @@ test "TlsTransport: init with insecure config" {
     try testing.expect(t.insecure);
     try testing.expect(t.root_ca == null);
     try testing.expect(t.auth == null);
+    try testing.expect(t.tls_server_name == null);
+}
+
+test "TlsTransport: tls_server_name is stored from config" {
+    const cfg = config_mod.Config{
+        .allocator = testing.allocator,
+        .server = try testing.allocator.dupe(u8, "https://10.0.0.1:6443"),
+        .namespace = try testing.allocator.dupe(u8, "default"),
+        .insecure = true,
+        .tls_server_name = try testing.allocator.dupe(u8, "kubernetes.internal"),
+    };
+    defer {
+        var owned = cfg;
+        owned.deinit();
+    }
+
+    var t = try TlsTransport.init(testing.allocator, testing.io, &cfg);
+    defer t.deinit();
+
+    try testing.expectEqualStrings("10.0.0.1", t.host);
+    try testing.expect(t.tls_server_name != null);
+    try testing.expectEqualStrings("kubernetes.internal", t.tls_server_name.?);
 }
 
 test "TlsTransport: init rejects client cert without key" {

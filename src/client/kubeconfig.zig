@@ -97,10 +97,23 @@ pub const User = struct {
     }
 };
 
+pub const ExecEnvVar = struct {
+    name: []const u8,
+    value: []const u8,
+
+    pub fn deinit(self: *const ExecEnvVar, allocator: Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.value);
+    }
+};
+
 pub const ExecConfig = struct {
     api_version: ?[]const u8 = null,
     command: []const u8,
     args: ?[]const []const u8 = null,
+    env: ?[]const ExecEnvVar = null,
+    install_hint: ?[]const u8 = null,
+    provide_cluster_info: bool = false,
 
     pub fn deinit(self: *ExecConfig, allocator: Allocator) void {
         if (self.api_version) |v| allocator.free(v);
@@ -109,6 +122,11 @@ pub const ExecConfig = struct {
             for (args) |a| allocator.free(a);
             allocator.free(args);
         }
+        if (self.env) |envs| {
+            for (envs) |e| e.deinit(allocator);
+            allocator.free(envs);
+        }
+        if (self.install_hint) |v| allocator.free(v);
     }
 };
 
@@ -335,6 +353,10 @@ fn parseExecConfig(allocator: Allocator, val: ?json.Value) !?ExecConfig {
     if (obj.get("args")) |args_val| {
         if (args_val == .array) {
             var args: std.ArrayList([]const u8) = .empty;
+            errdefer {
+                for (args.items) |a| allocator.free(a);
+                args.deinit(allocator);
+            }
             for (args_val.array.items) |arg| {
                 if (arg == .string) {
                     try args.append(allocator, try allocator.dupe(u8, arg.string));
@@ -343,11 +365,51 @@ fn parseExecConfig(allocator: Allocator, val: ?json.Value) !?ExecConfig {
             args_list = try args.toOwnedSlice(allocator);
         }
     }
+    errdefer if (args_list) |args| {
+        for (args) |a| allocator.free(a);
+        allocator.free(args);
+    };
+
+    var env_list: ?[]const ExecEnvVar = null;
+    if (obj.get("env")) |env_val| {
+        if (env_val == .array) {
+            var envs: std.ArrayList(ExecEnvVar) = .empty;
+            errdefer {
+                for (envs.items) |e| e.deinit(allocator);
+                envs.deinit(allocator);
+            }
+            for (env_val.array.items) |item| {
+                if (item != .object) continue;
+                const eo = item.object;
+                const name = if (eo.get("name")) |n| (if (n == .string) n.string else null) else null;
+                const value = if (eo.get("value")) |v2| (if (v2 == .string) v2.string else null) else null;
+                if (name != null and value != null) {
+                    try envs.append(allocator, .{
+                        .name = try allocator.dupe(u8, name.?),
+                        .value = try allocator.dupe(u8, value.?),
+                    });
+                }
+            }
+            if (envs.items.len > 0) env_list = try envs.toOwnedSlice(allocator);
+        }
+    }
+    errdefer if (env_list) |envs| {
+        for (envs) |e| e.deinit(allocator);
+        allocator.free(envs);
+    };
+
+    const provide_cluster_info = if (obj.get("provideClusterInfo")) |pci|
+        (pci == .bool and pci.bool)
+    else
+        false;
 
     return .{
         .api_version = try dupeStrOpt(allocator, obj.get("apiVersion")),
         .command = try allocator.dupe(u8, command_val.string),
         .args = args_list,
+        .env = env_list,
+        .install_hint = try dupeStrOpt(allocator, obj.get("installHint")),
+        .provide_cluster_info = provide_cluster_info,
     };
 }
 
@@ -394,10 +456,45 @@ fn parseExecConfigFromYaml(allocator: Allocator, val: ?Yaml.Value) !?ExecConfig 
         allocator.free(args);
     };
 
+    var env_list: ?[]const ExecEnvVar = null;
+    if (m.get("env")) |env_val| {
+        if (env_val.asList()) |list| {
+            var envs: std.ArrayList(ExecEnvVar) = .empty;
+            errdefer {
+                for (envs.items) |e| e.deinit(allocator);
+                envs.deinit(allocator);
+            }
+            for (list) |item| {
+                const em = item.asMap() orelse continue;
+                const name = if (em.get("name")) |n| n.asScalar() else null;
+                const value = if (em.get("value")) |v2| v2.asScalar() else null;
+                if (name != null and value != null) {
+                    try envs.append(allocator, .{
+                        .name = try allocator.dupe(u8, name.?),
+                        .value = try allocator.dupe(u8, value.?),
+                    });
+                }
+            }
+            if (envs.items.len > 0) env_list = try envs.toOwnedSlice(allocator);
+        }
+    }
+    errdefer if (env_list) |envs| {
+        for (envs) |e| e.deinit(allocator);
+        allocator.free(envs);
+    };
+
+    const provide_cluster_info = if (m.get("provideClusterInfo")) |pci|
+        std.mem.eql(u8, pci.asScalar() orelse "", "true")
+    else
+        false;
+
     return .{
         .api_version = try dupeYamlStrOpt(allocator, m.get("apiVersion")),
         .command = try allocator.dupe(u8, command),
         .args = args_list,
+        .env = env_list,
+        .install_hint = try dupeYamlStrOpt(allocator, m.get("installHint")),
+        .provide_cluster_info = provide_cluster_info,
     };
 }
 

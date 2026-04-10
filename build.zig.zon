@@ -37,12 +37,10 @@
             .hash = "protobuf-4.0.0-0e82aiVRKADqBA_uRGXB1NE86ABI0SUQMOYbiKwUbN6g",
         },
         .zig_yaml = .{
-            .url = "git+https://github.com/kubkon/zig-yaml#84d747bc80937a08ea1cf76a63fee12c5fb1dd61",
-            .hash = "zig_yaml-0.3.0-C1161vSrAgCEKLk0825Y_GtmnThQI6O_cqtkBHb57KT-",
+            .path = "../zig-yaml",
         },
         .tls = .{
-            .url = "git+https://github.com/ianic/tls.zig",
-            .hash = "tls-0.1.0-ER2e0lWpBQBMRW-oQxwuf5xqwPGor7Vs_W_xQdUHx7Qu",
+            .path = "../tls.zig",
         },
     },
     .paths = .{

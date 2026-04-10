@@ -8,6 +8,7 @@ pub const discovery = @import("discovery.zig");
 pub const discovery_cache = @import("discovery_cache.zig");
 pub const restmapper = @import("restmapper.zig");
 pub const tls_transport = @import("tls_transport.zig");
+pub const pem = @import("pem.zig");
 
 pub const Kubeconfig = kubeconfig.Kubeconfig;
 pub const Config = config.Config;
@@ -35,5 +36,6 @@ test {
     _ = discovery_cache;
     _ = restmapper;
     _ = tls_transport;
+    _ = pem;
     // transport and dynamic have no unit tests — they need a real API server
 }

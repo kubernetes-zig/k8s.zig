@@ -171,7 +171,7 @@ pub fn main() !void {
     var cfg = try loadConfig(io, allocator);
     defer cfg.deinit();
 
-    const namespace = if (envOwned(allocator, "NAMESPACE")) |ns| ns else try allocator.dupe(u8, cfg.namespace);
+    const namespace = if (envOwned(allocator, "K8S_ZIG_NAMESPACE")) |ns| ns else try allocator.dupe(u8, cfg.namespace);
     defer allocator.free(namespace);
 
     std.debug.print("k8s-zig memory profiler\n", .{});
